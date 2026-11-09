@@ -9,10 +9,17 @@ if [[ ${EUID} -ne 0 ]]; then
     exit 1
 fi
 
-command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
+# Build unless a binary was shipped alongside the sources.
+if [[ ! -x "${here}/wsl-throttle-agent" ]]; then
+    if ! command -v make >/dev/null || ! command -v c++ >/dev/null; then
+        echo "a C++17 compiler and make are required: apt install build-essential" >&2
+        exit 1
+    fi
+    make -C "${here}"
+fi
 
 install -d -m 0755 /usr/local/share/wsl-throttle
-install -m 0755 "${here}/agent.py" /usr/local/bin/wsl-throttle-agent
+install -m 0755 "${here}/wsl-throttle-agent" /usr/local/bin/wsl-throttle-agent
 install -m 0644 "${here}/wsl-throttle.service" /etc/systemd/system/wsl-throttle.service
 install -m 0644 "${here}/README.md" /usr/local/share/wsl-throttle/README.md 2>/dev/null || true
 

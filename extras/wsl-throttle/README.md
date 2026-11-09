@@ -12,13 +12,42 @@ file; this agent enforces it and reports back.
 
 | Path | Purpose |
 | --- | --- |
-| `agent.py` | The agent (poll loop, policy parsing, cgroup + docker enforcement) |
+| `agent.cpp` | Policy parsing, reconcile loop, status reporting |
+| `docker.cpp` | Everything that knows the docker CLI: limits, apply, grouped restore |
+| `sys.cpp` | Subprocess, file and host primitives |
+| `json.cpp` | Small JSON reader/writer (the state files are the only input) |
+| `Makefile` | `make` builds `wsl-throttle-agent` |
 | `wsl-throttle.service` | systemd unit, runs as root in `system.slice` |
-| `install.sh` | Install/update (must run as root) |
+| `install.sh` | Build + install/update (must run as root) |
 | `uninstall.sh` | Stop, restore limits, remove |
 
 Installed locations: `/usr/local/bin/wsl-throttle-agent` and
 `/etc/systemd/system/wsl-throttle.service`.
+
+## Build
+
+Needs a C++17 compiler and `make` (`apt install build-essential`). The binary is
+linked against a static libstdc++/libgcc, so at runtime it only needs libc.
+
+```bash
+make                    # -> ./wsl-throttle-agent, ~360 KB
+sudo ./install.sh       # builds if needed, then installs and restarts
+```
+
+## Cost
+
+The agent is deliberately cheap, because it runs forever:
+
+- **Steady state**: one `stat()` per second on `state.json`. An unchanged policy
+  costs no read, no parse and no subprocess - the reconcile is skipped entirely
+  because the applied state still matches.
+- **Transitions**: one `systemctl` call plus one `docker update`, regardless of
+  how many containers there are, because `docker update` takes a list. On this
+  machine 16 containers throttle in ~0.5s and restore in ~0.3s, against ~1.2s
+  for the per-container loop it replaced.
+- **Container discovery**: `docker ps` runs at most once every 15s, so a new
+  container is still picked up quickly without polling docker every second.
+- **Memory**: ~2.5MB resident (the Python agent it replaced held ~7.5MB).
 
 ## Channel
 
