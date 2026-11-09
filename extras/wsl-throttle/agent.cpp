@@ -145,8 +145,8 @@ class Agent {
     bool directory_ready();
     bool refresh_policy(std::string& error);
     Report reconcile(const policy::Policy& value);
-    int reconcile_containers(const policy::Policy& value,
-                             std::vector<std::string>& errors);
+    void reconcile_containers(const policy::Policy& value,
+                              std::vector<std::string>& errors);
     void forget_dead(const std::vector<std::string>& live);
     void write_status(const Report& report) const;
     void write_status_error(const std::string& error) const;
@@ -226,9 +226,13 @@ Report Agent::reconcile(const policy::Policy& value) {
     const bool rescan_due = !last_scan_ ||
                             now - *last_scan_ >= std::chrono::seconds(kRescanSeconds);
     if (changed || rescan_due) {
-        report.containers = reconcile_containers(value, errors);
+        reconcile_containers(value, errors);
         last_scan_ = now;
     }
+    // "containers" is what is currently under policy, not what this tick
+    // happened to touch, otherwise the reported count flaps to 0 between
+    // rescans and every flare rewrites status.json.
+    report.containers = static_cast<int>(originals_.size());
 
     if (value.throttle && changed && value.drop_caches) {
         sys::run({"sync"}, 30);
@@ -250,15 +254,15 @@ Report Agent::reconcile(const policy::Policy& value) {
     return report;
 }
 
-int Agent::reconcile_containers(const policy::Policy& value,
-                                std::vector<std::string>& errors) {
+void Agent::reconcile_containers(const policy::Policy& value,
+                                 std::vector<std::string>& errors) {
     std::vector<std::string> live;
     std::string error;
     if (!docker::running_ids(live, error)) {
         if (value.docker_enabled) {
             errors.push_back("docker ps: " + error);
         }
-        return 0;
+        return;
     }
     forget_dead(live);
 
@@ -274,7 +278,7 @@ int Agent::reconcile_containers(const policy::Policy& value,
                           " container(s)");
             save_originals();
         }
-        return static_cast<int>(restored.size());
+        return;
     }
 
     std::vector<std::string> untracked;
@@ -295,7 +299,7 @@ int Agent::reconcile_containers(const policy::Policy& value,
     limits.nano = static_cast<long long>(value.cpus_centi) * 10000000LL;
     limits.shares = kThrottledCpuShares;
     limits.mem = static_cast<long long>(value.memory_mb) * 1024 * 1024;
-    return docker::apply(limits, live, errors);
+    docker::apply(limits, live, errors);
 }
 
 void Agent::forget_dead(const std::vector<std::string>& live) {
