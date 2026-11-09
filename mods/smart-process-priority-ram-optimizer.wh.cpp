@@ -2,7 +2,7 @@
 // @id              smart-process-priority-ram-optimizer
 // @name            Smart Process Priority & RAM Optimizer
 // @description     Boosts foreground responsiveness, shields audio, network, and AI workloads, throttles runaway background CPU, and safely reclaims idle memory.
-// @version         1.0.3
+// @version         1.0.4
 // @author          gilnett
 // @github          https://github.com/gilnett
 // @include         windhawk.exe
@@ -55,6 +55,11 @@ Dynamically manages process priorities and memory allocation to keep foreground 
 - Detects dormant background browser and Electron renderers and trims their unused memory while keeping active UI and tabs intact.
 - Dynamically adapts to multi-process web architectures (Chromium, Gecko, Electron, etc.) without hardcoded process names.
 
+### 8. WSL2 & Docker Background Throttling
+- While WSL is in the background, caps CPU for the WSL session and lowers resource limits on running Docker containers.
+- Returns to normal on its own: focusing a WSL or terminal window, starting a game, unplugging the charger, or suspending all release the limits immediately, and throttling resumes as soon as those conditions end.
+- Linux processes live in a PID namespace Windows cannot see, and the memory of `vmmemWSL` belongs to the hypervisor, so the mod publishes its policy to a small state file that a root agent inside the distro enforces with cgroup v2 and the Docker CLI. The agent ships in the `wsl-throttle` folder of this repository.
+
 ## Settings
 
 All settings are optional and pre-configured for balanced out-of-the-box use.
@@ -76,6 +81,7 @@ Advanced options (e.g. EcoQoS, P/E-core affinity, power schemes) can be enabled 
 - **Early memory cap for heavy apps**: Reclaims memory from listed heavy apps once their memory exceeds the configured cap.
 - **Emergency clean hotkey (`Ctrl+Alt+F11`)**: Triggers an immediate memory reclamation pass with optional audio confirmation.
 - **Excluded processes**: Comma-separated list of executable names that must never be throttled or trimmed.
+- **WSL & Docker background throttling**: CPU cap for the WSL session and per-container limits while the distro is in the background (default: 35% and 1.5 CPUs per container). Restores as soon as WSL, a game, battery or sleep state calls for it.
 
 ## Compatibility
 - Supported OS: Windows 11 (all versions including 24H2).
@@ -89,6 +95,7 @@ If you find this mod useful, you can support its development and maintenance:
 - [Support on Buy Me a Coffee](https://buymeacoffee.com/gilnett)
 
 ## Credits & Acknowledgments
+- **Smart Process Priority & RAM Optimizer, the original mod**: written by **gilnett** (https://github.com/gilnett). Everything here except the WSL2/Docker throttling is their work.
 - **Process Lasso (Bitsum)**: Inspiration for the ProBalance concept and foreground responsiveness prioritization.
 - **LiveTuner (LT)**: Inspiration for dynamic real-time priority tuning heuristics.
 - **ISLC (Intelligent Standby List Cleaner by Wagnardsoft)**: Inspiration for adaptive threshold triggers and gaming memory management.
@@ -177,6 +184,36 @@ If you find this mod useful, you can support its development and maintenance:
 - excludedProcesses: ""
   $name: Excluded Processes (Immunity List)
   $description: Optional comma-separated list of executable names that must never be throttled or trimmed. Windows system components and Windhawk are protected automatically.
+- enableWslThrottling: true
+  $name: 6. WSL & Docker Background Throttling
+  $description: While WSL is in the background, caps CPU for the WSL session and lowers resource limits on running Docker containers. Restores immediately when a WSL or terminal window is focused, on battery, or during gaming. Requires the wsl-throttle agent installed inside the distro.
+- wslThrottleCpuPercent: 35
+  $name: WSL Background CPU Cap (%)
+  $description: CPU quota applied to the WSL user session while it is in the background (5% to 90%, default 35%). Covers interactive Linux processes; Docker containers are limited separately.
+- wslThrottleGraceMinutes: 3
+  $name: WSL Throttle Grace Period (minutes)
+  $description: How long WSL must stay in the background before throttling starts (0 to 120, default 3). Prevents throttling on a quick alt-tab away from a terminal.
+- wslEnableDockerThrottle: true
+  $name: Throttle Docker Containers
+  $description: Applies CPU limits to running containers while WSL is in the background and restores their original limits afterwards. Containers started while throttled are picked up automatically.
+- wslDockerCpuLimitCenti: 150
+  $name: Docker Container CPU Limit (hundredths of a core)
+  $description: CPU limit per container while throttled, in hundredths of a CPU core (10 to 6400, default 150 meaning 1.5 cores).
+- wslDockerMemoryLimitMb: 0
+  $name: Docker Container Memory Limit (MB)
+  $description: Hard memory limit per container while throttled (0 = leave memory alone, the safe default; a hard limit can OOM-kill a heavy build).
+- wslDropCachesOnThrottle: false
+  $name: Drop WSL Page Cache When Throttling
+  $description: Runs sync and drop_caches inside the distro when throttling starts. Reclaims page cache only; process memory is never touched.
+- wslForegroundProcesses: ""
+  $name: WSL Host Processes (Advanced)
+  $description: Optional comma-separated list of Windows process names treated as WSL being in use. Empty uses msrdc.exe, wslg.exe, wslhost.exe, wsl.exe, windowsterminal.exe, conhost.exe and openconsole.exe.
+- wslThrottleStateDir: ""
+  $name: WSL Throttle State Directory (Advanced)
+  $description: 'Directory the mod writes state.json to. Empty uses %LOCALAPPDATA%\WslThrottle, which the in-distro agent reads as /mnt/c/Users/<you>/AppData/Local/WslThrottle.'
+- wslDistroName: ""
+  $name: WSL Distro Name (Advanced)
+  $description: 'Restricts the policy to one distro, e.g. Ubuntu-22.04. Empty targets whichever distro runs the agent, which is the normal single-distro setup. An agent that knows its own distro name ignores a policy addressed to a different one, so several distros can share one state file.'
 */
 // ==/WindhawkModSettings==
 // clang-format on
@@ -490,6 +527,18 @@ struct ModSettings {
     bool pauseOnBattery = true;
     int processStartupGraceSeconds = 5;
     int checkIntervalSec = 10;
+
+    // WSL & Docker background throttling
+    bool enableWslThrottling = true;
+    int wslThrottleCpuPercent = 35;
+    int wslThrottleGraceMinutes = 3;
+    bool wslEnableDockerThrottle = true;
+    int wslDockerCpuLimitCenti = 150;
+    int wslDockerMemoryLimitMb = 0;
+    bool wslDropCachesOnThrottle = false;
+    std::vector<std::wstring> wslForegroundProcesses;
+    std::wstring wslThrottleStateDir;
+    std::wstring wslDistroName;
 };
 
 static ModSettings g_settings;
@@ -909,6 +958,7 @@ enum class LogCategory : uint8_t {
     Sanctuary,
     Memory,
     Power,
+    Wsl,
     Shutdown,
 };
 
@@ -932,6 +982,9 @@ static void LogEvent(LogCategory cat, const wchar_t* format, ...) {
         break;
     case LogCategory::Power:
         categoryTag = L"[Power] ";
+        break;
+    case LogCategory::Wsl:
+        categoryTag = L"[WSL] ";
         break;
     case LogCategory::Shutdown:
         categoryTag = L"[Shutdown] ";
@@ -1140,6 +1193,16 @@ static bool IsEssentialSystemSecurityProcess(const std::wstring& name) {
         L"syntpenh.exe", L"syntphelper.exe", L"etdctrl.exe", L"etdcontrol.exe",
         L"alpspad.exe", L"hcontrol.exe"};
     return kEssential.count(ToLower(name)) != 0;
+}
+
+// Memory and scheduling of a guest VM are owned by the hypervisor: the working
+// set of the vmmem process is the guest's RAM, so trimming it reclaims nothing
+// and would only inflate the reclaim statistics.
+static bool IsVirtualMachineHostProcess(const std::wstring& name) {
+    static const std::unordered_set<std::wstring> kHosts = {
+        L"vmmem", L"vmmemwsl", L"vmmemcmz", L"vmwp.exe", L"vmcompute.exe",
+        L"vmms.exe", L"wslservice.exe"};
+    return kHosts.count(ToLower(name)) != 0;
 }
 
 static bool IsWindhawkProcess(HANDLE hProcess) {
@@ -2757,6 +2820,309 @@ static void RestoreAllThrottledProcesses() {
         }
     }
     g_throttledProcesses.clear();
+}
+
+// ---------------------------------------------------------------------------
+// WSL & Docker Background Throttling
+// ---------------------------------------------------------------------------
+//
+// Linux processes inside the WSL2 VM are invisible to the Windows PID
+// namespace, and the Vmmem process that backs the guest's RAM belongs to the
+// hypervisor: it can neither be trimmed productively nor throttled per process.
+// This module therefore only decides policy and publishes it as a small JSON
+// state file. A root agent inside the distro enforces it with cgroup v2 and the
+// Docker CLI, and reports the result back through status.json.
+
+static const wchar_t* const kWslThrottleSubdir = L"\\WslThrottle";
+static constexpr int kWslPublishRefreshSec = 45;
+
+enum class WslThrottleMode : uint8_t {
+    Restore,
+    Throttle,
+};
+
+struct WslThrottleRequest {
+    WslThrottleMode mode = WslThrottleMode::Restore;
+    const wchar_t* reason = L"startup";
+    int cpuQuotaPercent = 35;
+    bool dockerEnabled = true;
+    int dockerCpuCenti = 150;
+    int dockerMemoryMb = 0;
+    bool dropCaches = false;
+    std::wstring distro;
+
+    bool operator==(const WslThrottleRequest& other) const {
+        return mode == other.mode && wcscmp(reason, other.reason) == 0 &&
+               cpuQuotaPercent == other.cpuQuotaPercent &&
+               dockerEnabled == other.dockerEnabled &&
+               dockerCpuCenti == other.dockerCpuCenti &&
+               dockerMemoryMb == other.dockerMemoryMb &&
+               dropCaches == other.dropCaches && distro == other.distro;
+    }
+};
+
+static std::mutex g_wslThrottleMutex;
+static std::chrono::steady_clock::time_point g_wslLastPublishTime{};
+static std::chrono::steady_clock::time_point g_wslLastForegroundTime{};
+static WslThrottleRequest g_wslPublishedRequest{};
+static bool g_wslHasPublished = false;
+static bool g_wslWriteFailureLogged = false;
+
+// Keeps the distro name from breaking the JSON payload: letters, digits, dots,
+// dashes, underscores, spaces and parentheses survive, everything else is
+// dropped. The agent applies the same rule, so the two can never disagree.
+static std::wstring SanitizeWslToken(const std::wstring& value) {
+    std::wstring result;
+    result.reserve(value.size());
+    for (wchar_t c : value) {
+        bool keep = (c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'z') ||
+                    (c >= L'A' && c <= L'Z') || c == L'.' || c == L'-' ||
+                    c == L'_' || c == L' ' || c == L'(' || c == L')';
+        if (keep && result.size() < 64) {
+            result.push_back(c);
+        }
+    }
+    return result;
+}
+
+static std::wstring GetWslThrottleDir(const ModSettings& settings) {
+    std::wstring dir = Trim(settings.wslThrottleStateDir);
+    if (!dir.empty()) {
+        return dir;
+    }
+    wchar_t buffer[MAX_PATH];
+    DWORD length =
+        GetEnvironmentVariableW(L"LOCALAPPDATA", buffer, ARRAYSIZE(buffer));
+    if (length == 0 || length >= ARRAYSIZE(buffer)) {
+        return std::wstring();
+    }
+    return std::wstring(buffer) + kWslThrottleSubdir;
+}
+
+static bool WriteUtf8FileAtomic(const std::wstring& path,
+                                const std::string& body) {
+    std::wstring tmpPath = path + L".tmp";
+    HANDLE handle = CreateFileW(tmpPath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD written = 0;
+    BOOL ok = WriteFile(handle, body.data(), static_cast<DWORD>(body.size()),
+                        &written, nullptr);
+    if (ok) {
+        FlushFileBuffers(handle);
+    }
+    CloseHandle(handle);
+    if (!ok || written != static_cast<DWORD>(body.size())) {
+        DeleteFileW(tmpPath.c_str());
+        return false;
+    }
+    return MoveFileExW(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING) !=
+           FALSE;
+}
+
+static void PublishWslThrottleRequest(const ModSettings& settings,
+                                      const WslThrottleRequest& request,
+                                      bool force) {
+    std::wstring dir = GetWslThrottleDir(settings);
+    if (dir.empty()) {
+        return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(g_wslThrottleMutex);
+        bool unchanged = g_wslHasPublished && g_wslPublishedRequest == request;
+        auto age = std::chrono::duration_cast<std::chrono::seconds>(
+                       now - g_wslLastPublishTime)
+                       .count();
+        // Refresh periodically so the agent can tell a live mod from an
+        // unloaded one; nothing is written while the request is unchanged and
+        // still fresh.
+        if (!force && unchanged && age < kWslPublishRefreshSec) {
+            return;
+        }
+        g_wslPublishedRequest = request;
+        g_wslHasPublished = true;
+        g_wslLastPublishTime = now;
+    }
+
+    if (!CreateDirectoryW(dir.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        if (!g_wslWriteFailureLogged) {
+            g_wslWriteFailureLogged = true;
+            LogEvent(LogCategory::Wsl,
+                     L"Cannot create state directory %s (error %lu)", dir.c_str(),
+                     GetLastError());
+        }
+        return;
+    }
+
+    long long generated = static_cast<long long>(
+        std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+    std::wstring distroToken = SanitizeWslToken(request.distro);
+
+    wchar_t payload[512];
+    swprintf_s(payload, _countof(payload),
+               L"{\"version\":1,\"mode\":\"%s\",\"reason\":\"%s\","
+               L"\"generated\":%lld,\"cpu_quota_percent\":%d,"
+               L"\"docker\":{\"enabled\":%s,\"cpus_centi\":%d,"
+               L"\"memory_mb\":%d},\"drop_caches\":%s,\"distro\":\"%s\"}",
+               request.mode == WslThrottleMode::Throttle ? L"throttle"
+                                                         : L"restore",
+               request.reason, generated, request.cpuQuotaPercent,
+               request.dockerEnabled ? L"true" : L"false",
+               request.dockerCpuCenti, request.dockerMemoryMb,
+               request.dropCaches ? L"true" : L"false", distroToken.c_str());
+
+    int utf8Length = WideCharToMultiByte(CP_UTF8, 0, payload, -1, nullptr, 0,
+                                         nullptr, nullptr);
+    if (utf8Length <= 1) {
+        return;
+    }
+    std::string utf8(static_cast<size_t>(utf8Length), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, payload, -1, utf8.data(), utf8Length, nullptr,
+                        nullptr);
+    utf8.resize(static_cast<size_t>(utf8Length - 1));
+
+    if (!WriteUtf8FileAtomic(dir + L"\\state.json", utf8) &&
+        !g_wslWriteFailureLogged) {
+        g_wslWriteFailureLogged = true;
+        LogEvent(LogCategory::Wsl, L"Cannot write state.json in %s (error %lu)",
+                 dir.c_str(), GetLastError());
+    }
+}
+
+// Surfaces the agent's own report in the mod log, once per change.
+static void PollWslThrottleStatus(const ModSettings& settings) {
+    std::wstring dir = GetWslThrottleDir(settings);
+    if (dir.empty()) {
+        return;
+    }
+    std::wstring path = dir + L"\\status.json";
+
+    WIN32_FILE_ATTRIBUTE_DATA attributes{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes)) {
+        return;
+    }
+    static FILETIME lastWrite{};
+    static bool haveLastWrite = false;
+    if (haveLastWrite &&
+        attributes.ftLastWriteTime.dwLowDateTime == lastWrite.dwLowDateTime &&
+        attributes.ftLastWriteTime.dwHighDateTime == lastWrite.dwHighDateTime) {
+        return;
+    }
+    lastWrite = attributes.ftLastWriteTime;
+    haveLastWrite = true;
+
+    HANDLE handle =
+        CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    char buffer[512]{};
+    DWORD read = 0;
+    BOOL ok = ReadFile(handle, buffer, sizeof(buffer) - 1, &read, nullptr);
+    CloseHandle(handle);
+    if (!ok || read == 0) {
+        return;
+    }
+
+    wchar_t wide[512];
+    int wideLength = MultiByteToWideChar(CP_UTF8, 0, buffer,
+                                         static_cast<int>(read), wide,
+                                         ARRAYSIZE(wide) - 1);
+    if (wideLength <= 0) {
+        return;
+    }
+    wide[wideLength] = L'\0';
+    LogEvent(LogCategory::Wsl, L"%s", wide);
+}
+
+static bool IsWslHostProcessName(const std::wstring& name,
+                                 const ModSettings& settings) {
+    static const wchar_t* const kDefaultHosts[] = {
+        L"msrdc.exe",   L"wslg.exe",          L"wslhost.exe",
+        L"wsl.exe",     L"windowsterminal.exe", L"conhost.exe",
+        L"openconsole.exe",
+    };
+    if (!settings.wslForegroundProcesses.empty()) {
+        return IsInList(name, settings.wslForegroundProcesses);
+    }
+    for (const wchar_t* host : kDefaultHosts) {
+        if (name == host) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void RequestWslThrottleRestore(const ModSettings& settings,
+                                      const wchar_t* reason) {
+    WslThrottleRequest request;
+    request.mode = WslThrottleMode::Restore;
+    request.reason = reason;
+    request.cpuQuotaPercent = settings.wslThrottleCpuPercent;
+    request.dockerEnabled = settings.wslEnableDockerThrottle;
+    request.dockerCpuCenti = settings.wslDockerCpuLimitCenti;
+    request.dockerMemoryMb = settings.wslDockerMemoryLimitMb;
+    request.distro = settings.wslDistroName;
+    PublishWslThrottleRequest(settings, request, /*force=*/true);
+}
+
+static void UpdateWslBackgroundThrottle(const ModSettings& settings,
+                                        DWORD foregroundPid,
+                                        bool inGamingLockdown,
+                                        bool onBattery) {
+    auto now = std::chrono::steady_clock::now();
+
+    std::wstring foregroundName = GetProcessNameByPid(foregroundPid);
+    if (!foregroundName.empty() &&
+        IsWslHostProcessName(foregroundName, settings)) {
+        std::lock_guard<std::mutex> lock(g_wslThrottleMutex);
+        g_wslLastForegroundTime = now;
+    }
+
+    WslThrottleRequest request;
+    request.cpuQuotaPercent = settings.wslThrottleCpuPercent;
+    request.dockerEnabled = settings.wslEnableDockerThrottle;
+    request.dockerCpuCenti = settings.wslDockerCpuLimitCenti;
+    request.dockerMemoryMb = settings.wslDockerMemoryLimitMb;
+    request.dropCaches = settings.wslDropCachesOnThrottle;
+    request.distro = settings.wslDistroName;
+
+    if (!settings.enableWslThrottling) {
+        request.mode = WslThrottleMode::Restore;
+        request.reason = L"disabled";
+    } else if (onBattery) {
+        request.mode = WslThrottleMode::Restore;
+        request.reason = L"battery";
+    } else if (g_systemSuspended.load(std::memory_order_relaxed)) {
+        request.mode = WslThrottleMode::Restore;
+        request.reason = L"suspended";
+    } else if (inGamingLockdown) {
+        request.mode = WslThrottleMode::Restore;
+        request.reason = L"gaming";
+    } else {
+        std::chrono::steady_clock::time_point lastForeground;
+        {
+            std::lock_guard<std::mutex> lock(g_wslThrottleMutex);
+            lastForeground = g_wslLastForegroundTime;
+        }
+        auto grace = std::chrono::seconds(settings.wslThrottleGraceMinutes * 60);
+        if (now - lastForeground < grace) {
+            request.mode = WslThrottleMode::Restore;
+            request.reason = L"wsl-foreground";
+        } else {
+            request.mode = WslThrottleMode::Throttle;
+            request.reason = L"wsl-background";
+        }
+    }
+
+    PublishWslThrottleRequest(settings, request, /*force=*/false);
+    PollWslThrottleStatus(settings);
 }
 
 static void RestoreAllSoftTrimmedProcesses() {
@@ -4653,6 +5019,10 @@ static TrimStats TrimBackgroundWorkingSets(const ModSettings& settings,
             return false;
         }
 
+        if (IsVirtualMachineHostProcess(n)) {
+            return false;
+        }
+
         auto preDec = arbiter.EvaluatePreOpen(p, n, ActionType::TrimWorkingSet,
                                               &windowStates, graceSeconds);
         bool isTargetListed = (!settings.customTargetList.empty() &&
@@ -5047,6 +5417,7 @@ static LRESULT CALLBACK PowerWndProc(HWND hwnd, UINT uMsg, WPARAM wParam,
                 RestoreForegroundBoostLocked();
             }
             RestoreAllThrottledProcesses();
+            RequestWslThrottleRestore(GetSettingsSnapshot(), L"suspended");
         } else if (wParam == PBT_APMRESUMEAUTOMATIC ||
                    wParam == PBT_APMRESUMESUSPEND) {
             g_lastResumeTick.store(GetTickCount64(), std::memory_order_release);
@@ -5301,6 +5672,9 @@ static void MemoryOptimizerWorker() {
                                  L"Game inactive, resuming memory management");
                     }
                 }
+
+                UpdateWslBackgroundThrottle(settings, fgPid, inGamingLockdown,
+                                            onBattery);
 
                 if (!onBattery && !recentlyResumed && !inGamingLockdown) {
                     MEMORYSTATUSEX mem;
@@ -5559,6 +5933,32 @@ static void LoadSettings() {
     g_settings.enablePanicHotkey = Wh_GetIntSetting(L"enablePanicHotkey") != 0;
     g_settings.enableHotkeySound = Wh_GetIntSetting(L"enableHotkeySound") != 0;
 
+    // Section 5: WSL & Docker Background Throttling
+    g_settings.enableWslThrottling = Wh_GetIntSetting(L"enableWslThrottling") != 0;
+    g_settings.wslThrottleCpuPercent = std::clamp(
+        (int)Wh_GetIntSetting(L"wslThrottleCpuPercent"), 5, 90);
+    g_settings.wslThrottleGraceMinutes = std::clamp(
+        (int)Wh_GetIntSetting(L"wslThrottleGraceMinutes"), 0, 120);
+    g_settings.wslEnableDockerThrottle =
+        Wh_GetIntSetting(L"wslEnableDockerThrottle") != 0;
+    g_settings.wslDockerCpuLimitCenti = std::clamp(
+        (int)Wh_GetIntSetting(L"wslDockerCpuLimitCenti"), 10, 6400);
+    g_settings.wslDockerMemoryLimitMb = std::clamp(
+        (int)Wh_GetIntSetting(L"wslDockerMemoryLimitMb"), 0, 262144);
+    g_settings.wslDropCachesOnThrottle =
+        Wh_GetIntSetting(L"wslDropCachesOnThrottle") != 0;
+
+    auto wslHostsStr =
+        WindhawkUtils::StringSetting::make(L"wslForegroundProcesses");
+    g_settings.wslForegroundProcesses = ParseProcessList(wslHostsStr.get());
+
+    auto wslStateDirStr =
+        WindhawkUtils::StringSetting::make(L"wslThrottleStateDir");
+    g_settings.wslThrottleStateDir = Trim(wslStateDirStr.get());
+
+    auto wslDistroStr = WindhawkUtils::StringSetting::make(L"wslDistroName");
+    g_settings.wslDistroName = SanitizeWslToken(Trim(wslDistroStr.get()));
+
     // Hardware-Aware Auto-Tuning:
     // Automatically adapt thresholds to the machine's physical hardware capacity.
     SystemHardwareProfile hw = GetHardwareProfile();
@@ -5609,6 +6009,14 @@ BOOL WhTool_ModInit() {
     CheckAndRecoverCrashedPowerScheme();
 
     LoadSettings();
+
+    // Start unthrottled: a state file left behind by a previous session must
+    // not keep the distro capped while this instance warms up.
+    {
+        std::lock_guard<std::mutex> lock(g_wslThrottleMutex);
+        g_wslLastForegroundTime = std::chrono::steady_clock::now();
+    }
+    RequestWslThrottleRestore(GetSettingsSnapshot(), L"startup");
 
     g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_wakeEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -5735,6 +6143,7 @@ void WhTool_ModUninit() {
 
     RestoreAllThrottledProcesses();
     RestoreAllSoftTrimmedProcesses();
+    RequestWslThrottleRestore(GetSettingsSnapshot(), L"uninit");
     g_audioPidLastActive.clear();
     g_audioPidsCache.clear();
     g_audioWorkerSamples.clear();

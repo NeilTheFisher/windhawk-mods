@@ -1,0 +1,16 @@
+[Unit]
+Description=WSL background throttle agent (driven by the Windhawk RAM optimizer mod)
+Documentation=file:///usr/local/share/wsl-throttle/README.md
+After=local-fs.target
+ConditionPathIsMountPoint=/mnt/c
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wsl-throttle-agent
+Restart=always
+RestartSec=3
+# Lives in system.slice, so the user.slice CPU cap never starves the agent.
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
