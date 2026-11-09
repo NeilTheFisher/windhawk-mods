@@ -118,18 +118,37 @@ A game exiting is the interesting case: gaming lockdown is re-checked on every
 tick, so the moment its trailing grace period lapses the mod publishes
 `wsl-background` again and the cap comes back. Nothing has to be clicked.
 
+## Tests
+
+`make test` builds and runs the unit tests (no root, no docker, no Windows side
+needed). They cover the places where a silent bug would strand a container:
+
+- JSON parsing: the exact state file the mod writes, malformed input, escapes,
+  and number clamping.
+- Policy: throttle/restore, unknown mode rejected, missing fields falling back to
+  safe defaults, out-of-range values clamped, the distro gate (including
+  case-insensitivity), staleness, and the applied-state signature.
+- Docker: the exact `docker update` argv, memory/swap handling, and the limit
+  grouping that decides how many calls a transition costs.
+- Host primitives: splitting and trimming the CLI output that gets parsed.
+
 ## Choosing a distro
 
 `wslDistroName` defaults to empty, which means "whichever distro runs the
 agent" - the normal single-distro case, and the recommended setting.
 
-Set it (e.g. `Ubuntu-22.04`) only if you run the agent in more than one distro
-and want the policy to land in exactly one. `install.sh` records the distro it
-was installed into in `/etc/wsl-throttle/distro`; an agent whose recorded name
-differs from the policy's ignores the policy and restores instead
-(`reason: distro-mismatch`). Nothing about the distro is compiled in: if
-`/etc/wsl-throttle/distro` is missing and `WSL_DISTRO_NAME` is unset, the agent
-accepts any policy.
+Set it (e.g. `Ubuntu`) only if you run the agent in more than one distro and
+want the policy to land in exactly one. The name must match what
+`wsl.exe -l -v` reports (comparison ignores case, so `ubuntu` is fine);
+`install.sh` records it automatically from `WSL_DISTRO_NAME` into
+`/etc/wsl-throttle/distro`. An agent whose recorded name differs from the
+policy's ignores the policy and restores instead (`reason: distro-mismatch`).
+Nothing about the distro is compiled in: if `/etc/wsl-throttle/distro` is
+missing and `WSL_DISTRO_NAME` is unset, the agent accepts any policy.
+
+Getting the two sides out of sync is the one failure mode worth knowing: if the
+agent records `Ubuntu-22.04` while the real name is `Ubuntu`, every policy will
+be dropped as a mismatch. `wsl.exe -l -v` is the source of truth.
 
 ## Failsafes
 

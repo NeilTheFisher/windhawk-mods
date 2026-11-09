@@ -28,6 +28,11 @@ struct Limits {
 
 bool running_ids(std::vector<std::string>& ids, std::string& error);
 
+// The exact `docker update` argv for a limit set. Exposed so tests can pin it:
+// getting this wrong leaves containers capped with no way back.
+std::vector<std::string> update_argv(const Limits& limits,
+                                     const std::vector<std::string>& ids);
+
 // Reads the limits currently set on `ids`. `memory_limited` records whether the
 // caller intends to change memory, so the original is restored only then.
 bool originals_of(const std::vector<std::string>& ids, bool memory_limited,

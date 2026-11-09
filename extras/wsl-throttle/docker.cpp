@@ -19,24 +19,6 @@ std::string format_cpus(long long nano) {
     return buffer;
 }
 
-std::vector<std::string> update_argv(const Limits& limits,
-                                     const std::vector<std::string>& ids) {
-    std::vector<std::string> argv{"docker",
-                                  "update",
-                                  "--cpus",
-                                  format_cpus(limits.nano),
-                                  "--cpu-shares",
-                                  std::to_string(limits.shares)};
-    if (limits.mem > 0) {
-        argv.push_back("--memory");
-        argv.push_back(std::to_string(limits.mem));
-        argv.push_back("--memory-swap");
-        argv.push_back(std::to_string(limits.swap > 0 ? limits.swap
-                                                     : limits.mem * 2));
-    }
-    argv.insert(argv.end(), ids.begin(), ids.end());
-    return argv;
-}
 
 bool parse_number(const std::string& field, long long& out) {
     const std::string text = sys::trim(field);
@@ -54,6 +36,25 @@ bool parse_number(const std::string& field, long long& out) {
 }
 
 }  // namespace
+
+std::vector<std::string> update_argv(const Limits& limits,
+                                     const std::vector<std::string>& ids) {
+    std::vector<std::string> argv{"docker",
+                                  "update",
+                                  "--cpus",
+                                  format_cpus(limits.nano),
+                                  "--cpu-shares",
+                                  std::to_string(limits.shares)};
+    if (limits.mem > 0) {
+        argv.push_back("--memory");
+        argv.push_back(std::to_string(limits.mem));
+        argv.push_back("--memory-swap");
+        argv.push_back(std::to_string(limits.swap > 0 ? limits.swap
+                                                      : limits.mem * 2));
+    }
+    argv.insert(argv.end(), ids.begin(), ids.end());
+    return argv;
+}
 
 bool Limits::operator<(const Limits& other) const {
     return std::tie(nano, shares, mem, swap) <

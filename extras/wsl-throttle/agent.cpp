@@ -34,11 +34,11 @@
 #include <map>
 #include <optional>
 #include <string>
-#include <tuple>
 #include <vector>
 
 #include "docker.hpp"
 #include "json.hpp"
+#include "policy.hpp"
 #include "sys.hpp"
 
 namespace {
@@ -63,21 +63,6 @@ volatile sig_atomic_t g_stop = 0;
 
 void on_signal(int) { g_stop = 1; }
 
-// Mirror of the mod's SanitizeWslToken: the two sides must agree exactly.
-std::string sanitize_token(std::string_view value) {
-    std::string result;
-    result.reserve(value.size());
-    for (const char c : value) {
-        const bool keep = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
-                          (c >= 'A' && c <= 'Z') || c == '.' || c == '-' ||
-                          c == '_' || c == ' ' || c == '(' || c == ')';
-        if (keep && result.size() < 64) {
-            result.push_back(c);
-        }
-    }
-    return result;
-}
-
 const std::string& own_distro() {
     static const std::string name = [] {
         std::string text;
@@ -85,49 +70,10 @@ const std::string& own_distro() {
             const char* from_env = std::getenv("WSL_DISTRO_NAME");
             text = from_env != nullptr ? from_env : "";
         }
-        return sanitize_token(sys::trim(std::move(text)));
+        return policy::sanitize_token(sys::trim(std::move(text)));
     }();
     return name;
 }
-
-struct Policy {
-    bool throttle = false;
-    std::string reason = "startup";
-    long long generated = 0;
-    int cpu_percent = 35;
-    bool docker_enabled = true;
-    int cpus_centi = 150;
-    int memory_mb = 0;
-    bool drop_caches = false;
-    std::string distro;
-};
-
-// What was last successfully applied. A struct rather than a magic string, so
-// "did the policy change" is a plain comparison.
-struct Applied {
-    bool throttle = false;
-    int cpu_percent = 0;
-    bool docker_enabled = false;
-    int cpus_centi = 0;
-    int memory_mb = 0;
-
-    static Applied from(const Policy& policy) {
-        Applied applied;
-        applied.throttle = policy.throttle;
-        applied.cpu_percent = policy.throttle ? policy.cpu_percent : 0;
-        applied.docker_enabled = policy.throttle && policy.docker_enabled;
-        applied.cpus_centi = policy.cpus_centi;
-        applied.memory_mb = policy.memory_mb;
-        return applied;
-    }
-
-    bool operator==(const Applied& other) const {
-        return std::tie(throttle, cpu_percent, docker_enabled, cpus_centi,
-                        memory_mb) ==
-               std::tie(other.throttle, other.cpu_percent, other.docker_enabled,
-                        other.cpus_centi, other.memory_mb);
-    }
-};
 
 struct Report {
     std::string mode;
@@ -185,8 +131,6 @@ class Agent {
     std::optional<Report> step();
     void run_reset();
     void print_status() const;
-    size_t tracked_count() const { return originals_.size(); }
-    const std::optional<std::string>& directory() const { return directory_; }
 
   private:
     struct FileStamp {
@@ -200,8 +144,8 @@ class Agent {
 
     bool directory_ready();
     bool refresh_policy(std::string& error);
-    Report reconcile(const Policy& policy);
-    int reconcile_containers(const Policy& policy,
+    Report reconcile(const policy::Policy& value);
+    int reconcile_containers(const policy::Policy& value,
                              std::vector<std::string>& errors);
     void forget_dead(const std::vector<std::string>& live);
     void write_status(const Report& report) const;
@@ -211,9 +155,9 @@ class Agent {
 
     std::optional<std::string> directory_;
     std::map<std::string, docker::Original> originals_;
-    std::optional<Applied> applied_;
+    std::optional<policy::Applied> applied_;
     std::optional<Report> last_report_;
-    std::optional<Policy> policy_;
+    std::optional<policy::Policy> policy_;
     std::optional<FileStamp> policy_stamp_;
     std::optional<std::chrono::steady_clock::time_point> last_scan_;
 };
@@ -244,63 +188,30 @@ bool Agent::refresh_policy(std::string& error) {
         error = std::string("cannot read state.json: ") + std::strerror(errno);
         return false;
     }
-    json::Value root;
-    if (!json::parse(body, root, error)) {
-        error = "state.json is not valid JSON: " + error;
+    policy::Policy parsed;
+    if (!policy::parse(body, parsed, error)) {
         return false;
     }
-    if (!root.is_object()) {
-        error = "state.json is not an object";
-        return false;
-    }
-    const std::string mode = json::as_string(root.get("mode"));
-    if (mode != "throttle" && mode != "restore") {
-        error = "state.json has unknown mode '" + mode + "'";
-        return false;
-    }
-
-    const json::Value* docker = root.get("docker");
-    Policy policy;
-    policy.throttle = mode == "throttle";
-    policy.reason = json::as_string(root.get("reason")).substr(0, 64);
-    policy.generated = json::as_int(root.get("generated"), 0, 0, 1LL << 40);
-    policy.cpu_percent =
-        static_cast<int>(json::as_int(root.get("cpu_quota_percent"), 35, 5, 90));
-    policy.docker_enabled =
-        json::as_bool(docker != nullptr ? docker->get("enabled") : nullptr, true);
-    policy.cpus_centi = static_cast<int>(json::as_int(
-        docker != nullptr ? docker->get("cpus_centi") : nullptr, 150, 10, 6400));
-    policy.memory_mb = static_cast<int>(json::as_int(
-        docker != nullptr ? docker->get("memory_mb") : nullptr, 0, 0, 262144));
-    policy.drop_caches = json::as_bool(root.get("drop_caches"), false);
-    policy.distro = sanitize_token(json::as_string(root.get("distro")));
-
-    // A policy addressed to a different distro must never be applied here.
-    const std::string& own = own_distro();
-    if (!policy.distro.empty() && !own.empty() && policy.distro != own) {
-        policy.throttle = false;
-        policy.reason = "distro-mismatch";
-    }
-
-    policy_ = policy;
+    policy::gate_on_distro(parsed, own_distro());
+    policy_ = std::move(parsed);
     return true;
 }
 
-Report Agent::reconcile(const Policy& policy) {
+Report Agent::reconcile(const policy::Policy& value) {
     Report report;
-    report.mode = policy.throttle ? "throttle" : "restore";
-    report.reason = policy.reason;
-    report.cpu_percent = policy.throttle ? policy.cpu_percent : 0;
+    report.mode = value.throttle ? "throttle" : "restore";
+    report.reason = value.reason;
+    report.cpu_percent = value.throttle ? value.cpu_percent : 0;
     report.distro = own_distro();
 
     std::vector<std::string> errors;
-    const Applied target = Applied::from(policy);
+    const policy::Applied target = policy::applied_from(value);
     const bool changed = !applied_ || !(*applied_ == target);
 
     if (changed) {
         const std::string quota =
-            policy.throttle
-                ? "CPUQuota=" + std::to_string(policy.cpu_percent) + "%"
+            value.throttle
+                ? "CPUQuota=" + std::to_string(value.cpu_percent) + "%"
                 : std::string("CPUQuota=");
         const sys::RunResult result = sys::run(
             {"systemctl", "set-property", "--runtime", "user.slice", quota},
@@ -315,11 +226,11 @@ Report Agent::reconcile(const Policy& policy) {
     const bool rescan_due = !last_scan_ ||
                             now - *last_scan_ >= std::chrono::seconds(kRescanSeconds);
     if (changed || rescan_due) {
-        report.containers = reconcile_containers(policy, errors);
+        report.containers = reconcile_containers(value, errors);
         last_scan_ = now;
     }
 
-    if (policy.throttle && changed && policy.drop_caches) {
+    if (value.throttle && changed && value.drop_caches) {
         sys::run({"sync"}, 30);
         const int fd = open("/proc/sys/vm/drop_caches", O_WRONLY | O_CLOEXEC);
         if (fd < 0) {
@@ -334,23 +245,24 @@ Report Agent::reconcile(const Policy& policy) {
     }
 
     report.errors = errors;
-    applied_ = errors.empty() ? std::optional<Applied>(target) : std::nullopt;
+    applied_ = errors.empty() ? std::optional<policy::Applied>(target)
+                              : std::nullopt;
     return report;
 }
 
-int Agent::reconcile_containers(const Policy& policy,
+int Agent::reconcile_containers(const policy::Policy& value,
                                 std::vector<std::string>& errors) {
     std::vector<std::string> live;
     std::string error;
     if (!docker::running_ids(live, error)) {
-        if (policy.docker_enabled) {
+        if (value.docker_enabled) {
             errors.push_back("docker ps: " + error);
         }
         return 0;
     }
     forget_dead(live);
 
-    if (!policy.throttle || !policy.docker_enabled) {
+    if (!value.throttle || !value.docker_enabled) {
         // Turning the docker half off has to release what it capped, not leave
         // containers limited until the next mode change.
         const auto restored = docker::release(live, originals_, errors);
@@ -372,7 +284,7 @@ int Agent::reconcile_containers(const Policy& policy,
         }
     }
     if (!untracked.empty()) {
-        if (!docker::originals_of(untracked, policy.memory_mb > 0, originals_,
+        if (!docker::originals_of(untracked, value.memory_mb > 0, originals_,
                                   error)) {
             errors.push_back("docker inspect: " + error);
         }
@@ -380,9 +292,9 @@ int Agent::reconcile_containers(const Policy& policy,
     }
 
     docker::Limits limits;
-    limits.nano = static_cast<long long>(policy.cpus_centi) * 10000000LL;
+    limits.nano = static_cast<long long>(value.cpus_centi) * 10000000LL;
     limits.shares = kThrottledCpuShares;
-    limits.mem = static_cast<long long>(policy.memory_mb) * 1024 * 1024;
+    limits.mem = static_cast<long long>(value.memory_mb) * 1024 * 1024;
     return docker::apply(limits, live, errors);
 }
 
@@ -461,14 +373,13 @@ std::optional<Report> Agent::step() {
         return std::nullopt;
     }
 
-    Policy policy = *policy_;
-    if (policy.throttle && policy.generated > 0 &&
-        std::time(nullptr) - policy.generated > kStaleSeconds) {
-        policy.throttle = false;
-        policy.reason = "state-stale";
+    policy::Policy value = *policy_;
+    if (policy::is_stale(value, std::time(nullptr), kStaleSeconds)) {
+        value.throttle = false;
+        value.reason = "state-stale";
     }
 
-    const Report report = reconcile(policy);
+    const Report report = reconcile(value);
     if (!last_report_ || !(*last_report_ == report)) {
         last_report_ = report;
         write_status(report);
@@ -485,10 +396,10 @@ void Agent::run_reset() {
         write_status(report);
     }
     applied_.reset();
-    Policy policy;
-    policy.throttle = false;
-    policy.reason = "manual-reset";
-    const Report report = reconcile(policy);
+    policy::Policy value;
+    value.throttle = false;
+    value.reason = "manual-reset";
+    const Report report = reconcile(value);
     sys::log_line("mode=" + report.mode + " reason=" + report.reason +
                   " containers=" + std::to_string(report.containers));
 }
