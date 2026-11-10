@@ -75,7 +75,8 @@ Every field is range-checked and only fixed argv vectors are spawned; nothing in
 the file is ever interpreted as a command or a shell fragment.
 
 `status.json` is written back (same directory) whenever the outcome changes, and
-the mod logs it as `[WSL] ...`.
+the mod logs it as `[WSL] ...`. It carries `mode`, `reason`, `cpu_quota_percent`,
+`containers`, `distro`, `busy` and `errors`.
 
 ## What is enforced
 
@@ -113,6 +114,7 @@ intervention:
 | `enableWslThrottling` turned off | `disabled` | immediately |
 | Mod unloaded or Windhawk exits | `uninit` | immediately |
 | `state.json` not refreshed for 300s (mod crashed) | `state-stale` | within 5 min |
+| **The distro is doing real work** (see below) | `wsl-busy` | immediately, and for as long as it lasts |
 
 A game exiting is the interesting case: gaming lockdown is re-checked on every
 tick, so the moment its trailing grace period lapses the mod publishes
@@ -131,6 +133,23 @@ needed). They cover the places where a silent bug would strand a container:
 - Docker: the exact `docker update` argv, memory/swap handling, and the limit
   grouping that decides how many calls a transition costs.
 - Host primitives: splitting and trimming the CLI output that gets parsed.
+
+## The busy veto (why it does not throttle while you work)
+
+The mod can only see Windows-side windows. A workload driven through a GUI - an
+editor running a build, an agent shell, a TUI - never puts a WSL window in the
+foreground, so a pure "no WSL window focused" rule caps the distro exactly while
+someone is using it.
+
+The agent therefore vetoes the cap on its own evidence: it samples
+`/sys/fs/cgroup/user.slice/cpu.stat` once per second and reports `busy` while
+interactive WSL work is above **0.20 of a core**. Two hot samples engage the
+veto, ~20s of quiet releases it, and idle on a loaded box measures ~0.06 cores,
+so a genuinely idle distro is still throttled. `status.json` carries the verdict
+as `busy` and the reason `wsl-busy`.
+
+Only `user.slice` counts. Docker lives in `system.slice`, so a busy container is
+still throttled - that is the case this feature exists for.
 
 ## Choosing a distro
 

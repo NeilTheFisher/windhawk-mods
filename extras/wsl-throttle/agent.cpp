@@ -59,6 +59,15 @@ constexpr long long kStaleSeconds = 300;
 constexpr int kQuotaTimeoutSeconds = 25;
 constexpr int kThrottledCpuShares = 256;
 
+// A distro that is doing real work must never be capped. The mod can only see
+// Windows-side windows, so a workload driven through a GUI (an editor, an agent
+// shell, a TUI) looks idle from there and gets capped mid-build. This is the
+// ground truth, measured from the cgroup itself.
+constexpr const char* kUserSliceCpuStat = "/sys/fs/cgroup/user.slice/cpu.stat";
+constexpr double kBusyCores = 0.20;   // one fifth of a core
+constexpr int kBusyEnterSamples = 2;
+constexpr int kBusyLeaveSamples = 20;  // ~20s of quiet before we may cap again
+
 volatile sig_atomic_t g_stop = 0;
 
 void on_signal(int) { g_stop = 1; }
@@ -75,19 +84,78 @@ const std::string& own_distro() {
     return name;
 }
 
+class CpuActivity {
+  public:
+    // Samples once per call; call it exactly once per poll tick.
+    bool busy() {
+        std::string text;
+        long long usage = 0;
+        if (!sys::read_file(kUserSliceCpuStat, text) || !parse_usage(text, usage)) {
+            return busy_;  // unreadable: keep the last verdict rather than flap
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (last_usage_) {
+            const double seconds =
+                std::chrono::duration<double>(now - last_time_).count();
+            if (seconds > 0.2) {
+                const double cores =
+                    static_cast<double>(usage - *last_usage_) / 1e6 / seconds;
+                if (cores >= kBusyCores) {
+                    ++hot_samples_;
+                    quiet_samples_ = 0;
+                } else {
+                    ++quiet_samples_;
+                    hot_samples_ = 0;
+                }
+                if (!busy_ && hot_samples_ >= kBusyEnterSamples) {
+                    busy_ = true;
+                } else if (busy_ && quiet_samples_ >= kBusyLeaveSamples) {
+                    busy_ = false;
+                }
+            }
+        }
+        last_usage_ = usage;
+        last_time_ = now;
+        return busy_;
+    }
+
+  private:
+    static bool parse_usage(const std::string& text, long long& out) {
+        const size_t position = text.find("usage_usec");
+        if (position == std::string::npos) {
+            return false;
+        }
+        char* end = nullptr;
+        const long long value =
+            std::strtoll(text.c_str() + position + 10, &end, 10);
+        if (end == text.c_str() + position + 10 || value < 0) {
+            return false;
+        }
+        out = value;
+        return true;
+    }
+
+    std::optional<long long> last_usage_;
+    std::chrono::steady_clock::time_point last_time_{};
+    int hot_samples_ = 0;
+    int quiet_samples_ = 0;
+    bool busy_ = false;
+};
+
 struct Report {
     std::string mode;
     std::string reason;
     int cpu_percent = 0;
     int containers = 0;
     std::string distro;
+    bool busy = false;
     std::vector<std::string> errors;
 
     bool operator==(const Report& other) const {
         return mode == other.mode && reason == other.reason &&
                cpu_percent == other.cpu_percent &&
                containers == other.containers && distro == other.distro &&
-               errors == other.errors;
+               busy == other.busy && errors == other.errors;
     }
 };
 
@@ -98,6 +166,7 @@ json::Value report_json(const Report& report) {
     json::set(root, "cpu_quota_percent", json::number_value(report.cpu_percent));
     json::set(root, "containers", json::number_value(report.containers));
     json::set(root, "distro", json::string_value(report.distro));
+    json::set(root, "busy", json::bool_value(report.busy));
     json::Value errors = json::array_value();
     for (const auto& problem : report.errors) {
         json::push(errors, json::string_value(problem));
@@ -160,6 +229,7 @@ class Agent {
     std::optional<policy::Policy> policy_;
     std::optional<FileStamp> policy_stamp_;
     std::optional<std::chrono::steady_clock::time_point> last_scan_;
+    CpuActivity activity_;
 };
 
 bool Agent::directory_ready() {
@@ -377,13 +447,20 @@ std::optional<Report> Agent::step() {
         return std::nullopt;
     }
 
+    const bool busy = activity_.busy();
     policy::Policy value = *policy_;
     if (policy::is_stale(value, std::time(nullptr), kStaleSeconds)) {
         value.throttle = false;
         value.reason = "state-stale";
+    } else if (value.throttle && busy) {
+        // Someone is working in the distro right now: releasing beats a cap
+        // that makes their build crawl.
+        value.throttle = false;
+        value.reason = "wsl-busy";
     }
 
-    const Report report = reconcile(value);
+    Report report = reconcile(value);
+    report.busy = busy;
     if (!last_report_ || !(*last_report_ == report)) {
         last_report_ = report;
         write_status(report);
