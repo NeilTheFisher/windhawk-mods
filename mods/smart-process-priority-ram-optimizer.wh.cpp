@@ -1,7 +1,7 @@
 // ==WindhawkMod==
 // @id              smart-process-priority-ram-optimizer
-// @name            Smart Process Priority & RAM Optimizer
-// @description     Boosts foreground responsiveness, shields audio, network, and AI workloads, throttles runaway background CPU, and safely reclaims idle memory.
+// @name            Smart Process Priority & RAM Optimizer (WSL Fork)
+// @description     Boosts foreground responsiveness, shields audio, network, and AI workloads, throttles runaway background CPU, reclaims idle memory, and throttles WSL/Docker while the distro is backgrounded.
 // @version         1.0.4
 // @author          gilnett
 // @github          https://github.com/gilnett
